@@ -1,0 +1,132 @@
+name: PDF→WebP 批量转换(云端,本地零CPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_fid:
+        description: '136 PDF 文件ID'
+        required: true
+      parent_fid:
+        description: '139 目标册目录ID'
+        required: true
+      vol_name:
+        description: '册目录名(如 別060-0011-02)'
+        required: true
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip
+          pip3 install pymupdf pillow requests --quiet
+
+      - name: 下载 PDF
+        run: |
+          python3 -c "
+          import requests, sys
+          # 136 token(从 GitHub Secrets)
+          PAN='https://open-api.123pan.com'
+          # 从 Secrets 获取凭据
+          client_id='${{ secrets.PAN136_CLIENT_ID }}'
+          client_secret='${{ secrets.PAN136_CLIENT_SECRET }}'
+          # 取 token
+          r=requests.post(PAN+'/api/v1/access_token', headers={'Platform':'open_platform'},
+              json={'clientID':client_id,'clientSecret':client_secret}, timeout=30)
+          tok=r.json().get('data',{}).get('accessToken')
+          H={'Platform':'open_platform','Authorization':'Bearer '+tok}
+          # 下载 PDF
+          fid=${{ inputs.pdf_fid }}
+          r=requests.get(PAN+'/api/v1/file/download_info', headers=H, params={'fileId':fid}, timeout=30)
+          url=r.json().get('data',{}).get('downloadUrl')
+          print(f'下载URL: {url[:60]}...')
+          r=requests.get(url, stream=True, timeout=300)
+          with open('input.pdf','wb') as f:
+            for chunk in r.iter_content(1024*1024):
+              if chunk: f.write(chunk)
+          import os
+          sz=os.path.getsize('input.pdf')
+          print(f'下载完成: {sz//1024//1024}MB')
+          "
+
+      - name: 转换 PDF→WebP
+        run: |
+          python3 -c "
+          import fitz, io, os, sys
+          from PIL import Image
+          doc=fitz.open('input.pdf')
+          n=doc.page_count
+          print(f'PDF 共 {n} 页')
+          os.makedirs('webp_out', exist_ok=True)
+          for i in range(n):
+              pix=doc[i].get_pixmap(dpi=120)
+              img=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
+              if pix.width>16383 or pix.height>16383:
+                  r=16383/max(pix.width,pix.height)
+                  img=img.resize((int(pix.width*r),int(pix.height*r)),Image.LANCZOS)
+              buf=io.BytesIO()
+              img.save(buf,'webp',quality=80,method=0)
+              with open(f'webp_out/page_{i+1:04d}.webp','wb') as f:
+                  f.write(buf.getvalue())
+              if (i+1)%10==0: print(f'  已转 {i+1}/{n} 页')
+          doc.close()
+          print(f'转换完成: {n} 页')
+          "
+
+      - name: 上传 WebP 到 139
+        run: |
+          python3 -c "
+          import requests, hashlib, os, time, sys
+          PAN='https://open-api.123pan.com'
+          # 139 token
+          client_id='${{ secrets.PAN139_CLIENT_ID }}'
+          client_secret='${{ secrets.PAN139_CLIENT_SECRET }}'
+          r=requests.post(PAN+'/api/v1/access_token', headers={'Platform':'open_platform'},
+              json={'clientID':client_id,'clientSecret':client_secret}, timeout=30)
+          tok=r.json().get('data',{}).get('accessToken')
+          H={'Platform':'open_platform','Authorization':'Bearer '+tok}
+          HJ=dict(H); HJ['Content-Type']='application/json'
+          parent='${{ inputs.parent_fid }}'
+          files=sorted(os.listdir('webp_out'))
+          print(f'上传 {len(files)} 个 webp 到 139 fid={parent}')
+          ok=fail=0
+          for pf in files:
+              path=os.path.join('webp_out',pf)
+              with open(path,'rb') as f: content=f.read()
+              sz=len(content)
+              md5=hashlib.md5(content).hexdigest()
+              # 1. create
+              r=requests.post(PAN+'/upload/v1/file/create', headers=HJ,
+                  json={'parentFileId':str(parent),'filename':pf,'etag':md5,'size':str(sz)}, timeout=30)
+              j=r.json()
+              d=j.get('data') or {}
+              if d.get('reuse') and d.get('fileID'):
+                  ok+=1; continue
+              preid=d.get('preuploadID')
+              if not preid:
+                  if '重复' in j.get('message',''): ok+=1; continue
+                  fail+=1; print(f'  FAIL {pf}: {j.get(\"message\")}'); continue
+              # 2. get_upload_url + PUT
+              r=requests.post(PAN+'/upload/v1/file/get_upload_url', headers=HJ,
+                  json={'preuploadID':preid,'sliceNo':1}, timeout=30)
+              presigned=r.json().get('data',{}).get('presignedURL')
+              if not presigned: fail+=1; continue
+              r=requests.put(presigned, data=content, headers={'Content-Type':'application/octet-stream'}, timeout=120)
+              if r.status_code!=200: fail+=1; continue
+              # 3. complete
+              for _ in range(60):
+                  r=requests.post(PAN+'/upload/v1/file/upload_complete', headers=HJ,
+                      json={'preuploadID':preid}, timeout=30)
+                  d=r.json().get('data') or {}
+                  if d.get('completed') and d.get('fileID'): ok+=1; break
+                  time.sleep(1)
+              else: fail+=1
+          print(f'上传完成: ok={ok} fail={fail}')
+          "
+
+      - name: 清理
+        if: always()
+        run: rm -rf input.pdf webp_out
