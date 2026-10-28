@@ -1,16 +1,17 @@
-name: PDF→WebP 批量转换(云端,本地零CPU)
+name: PDF→WebP 转换(云端,本地零CPU,零123凭据)
 
+# 链路(依 10-09 封号规矩:云端绝不持 123 凭据、绝不调 123 API):
+#   本地用 136 凭据换签名直链 pdf_url → 传给本 workflow
+#   → GitHub 仅 GET 该直链下载 PDF → 转 webp → 存 artifact
+#   → 本地 gh run download 回收 artifact → A盘中转 → 本机上传 139 → 即删
 on:
   workflow_dispatch:
     inputs:
       pdf_fid:
-        description: '136 PDF 文件ID'
+        description: '136 PDF 文件ID(仅用于 artifact 命名与日志)'
         required: true
-      parent_fid:
-        description: '139 目标册目录ID'
-        required: true
-      vol_name:
-        description: '册目录名(如 別060-0011-02)'
+      pdf_url:
+        description: '123 签名直链(本地生成,匿名可取,不含凭据)'
         required: true
 
 jobs:
@@ -24,33 +25,31 @@ jobs:
           sudo apt-get install -y -qq python3-pip
           pip3 install pymupdf pillow requests --quiet
 
-      - name: 下载 PDF
+      - name: 下载 PDF(仅 GET 签名直链,零 123 凭据/API)
+        env:
+          PDF_URL: ${{ inputs.pdf_url }}
         run: |
-          python3 -c "
-          import requests, sys
-          # 136 token(从 GitHub Secrets)
-          PAN='https://open-api.123pan.com'
-          # 从 Secrets 获取凭据
-          client_id='${{ secrets.PAN136_CLIENT_ID }}'
-          client_secret='${{ secrets.PAN136_CLIENT_SECRET }}'
-          # 取 token
-          r=requests.post(PAN+'/api/v1/access_token', headers={'Platform':'open_platform'},
-              json={'clientID':client_id,'clientSecret':client_secret}, timeout=30)
-          tok=r.json().get('data',{}).get('accessToken')
-          H={'Platform':'open_platform','Authorization':'Bearer '+tok}
-          # 下载 PDF
-          fid=${{ inputs.pdf_fid }}
-          r=requests.get(PAN+'/api/v1/file/download_info', headers=H, params={'fileId':fid}, timeout=30)
-          url=r.json().get('data',{}).get('downloadUrl')
-          print(f'下载URL: {url[:60]}...')
-          r=requests.get(url, stream=True, timeout=300)
-          with open('input.pdf','wb') as f:
-            for chunk in r.iter_content(1024*1024):
-              if chunk: f.write(chunk)
-          import os
-          sz=os.path.getsize('input.pdf')
-          print(f'下载完成: {sz//1024//1024}MB')
-          "
+          python3 <<'PY'
+          import os, sys, requests, time
+          url = os.environ['PDF_URL']
+          ok = False
+          for k in range(3):
+              try:
+                  r = requests.get(url, stream=True, timeout=300, allow_redirects=True)
+                  if r.status_code == 200:
+                      with open('input.pdf', 'wb') as f:
+                          for c in r.iter_content(1024 * 1024):
+                              if c:
+                                  f.write(c)
+                      ok = True
+                      break
+                  print('HTTP', r.status_code, r.text[:120]); time.sleep(5)
+              except Exception as e:
+                  print('retry', k, repr(e)[:120]); time.sleep(5)
+          if not ok:
+              sys.exit('下载失败(直链可能已过期)')
+          print('下载完成 MB=', os.path.getsize('input.pdf') // 1024 // 1024)
+          PY
 
       - name: 转换 PDF→WebP
         run: |
