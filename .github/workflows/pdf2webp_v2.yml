@@ -1,0 +1,101 @@
+name: PDF→WebP（公开仓 draft release 临时中转，零123凭据）
+
+# 链路（10-29 方案B 转向，GitHub 直连 123 已被 IP 封制作废）：
+#   本机直连下载 136 PDF → 传【公开仓 draft release】asset（本机用全量token建）
+#   → 本 workflow 用内置 GITHUB_TOKEN 同仓按 release_id 拉 asset（零外部凭据、公开仓免费无限）
+#   → 转 webp → 存 artifact →（可选合并 PP-OCR 出 txt）
+#   → 末尾【即删 release】，PDF 只在公开仓活一个 run
+# ⚠️ 坑：/releases/tags/{tag} 查不到 draft（404），必须按 release_id 取。
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_fid:
+        description: '136 PDF 文件ID（artifact 命名/日志用）'
+        required: true
+      release_id:
+        description: '公开仓本 PDF 的 draft release id（本机上传后回传）'
+        required: true
+
+permissions:
+  contents: write   # 末尾删 release 需要；内置 token 同仓读 release asset 用 contents:read
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip
+          pip3 install pymupdf pillow requests --quiet
+
+      - name: 从 draft release 拉 PDF（内置token按release_id，非by-tag）
+        env:
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          python3 <<'PY'
+          import os, sys, requests
+          tok = os.environ['GITHUB_TOKEN']; repo = os.environ['REPO']; rid = os.environ['RELEASE_ID']
+          H = {'Authorization': 'Bearer ' + tok, 'Accept': 'application/vnd.github+json'}
+          r = requests.get('https://api.github.com/repos/%s/releases/%s' % (repo, rid), headers=H, timeout=60)
+          if r.status_code != 200:
+              sys.exit('取 release 失败 HTTP%d %s' % (r.status_code, r.text[:160]))
+          assets = r.json().get('assets') or []
+          if not assets:
+              sys.exit('release 无 asset')
+          au = assets[0]['url']
+          d = requests.get(au, headers={'Authorization': 'Bearer ' + tok,
+                             'Accept': 'application/octet-stream'}, stream=True, timeout=600)
+          n = 0
+          with open('input.pdf', 'wb') as f:
+              for c in d.iter_content(1 << 20):
+                  f.write(c); n += len(c)
+          head = open('input.pdf', 'rb').read(4)
+          print('拉取 HTTP=%d 字节=%d 首4=%r' % (d.status_code, n, head))
+          if head != b'%PDF':
+              sys.exit('魔数非%%PDF，内容不可用')
+          print('期望 size=%s 实到=%d' % (assets[0].get('size'), n))
+          PY
+
+      - name: 转换 PDF→WebP
+        run: |
+          python3 -c "
+          import fitz, io, os
+          from PIL import Image
+          doc=fitz.open('input.pdf'); n=doc.page_count
+          print('PDF 共', n, '页')
+          os.makedirs('webp_out', exist_ok=True)
+          for i in range(n):
+              pix=doc[i].get_pixmap(dpi=120)
+              img=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
+              if pix.width>16383 or pix.height>16383:
+                  r=16383/max(pix.width,pix.height); img=img.resize((int(pix.width*r),int(pix.height*r)),Image.LANCZOS)
+              buf=io.BytesIO(); img.save(buf,'webp',quality=80,method=0)
+              open('webp_out/page_%04d.webp'%(i+1),'wb').write(buf.getvalue())
+          doc.close()
+          "
+
+      # ===== PP-OCR 合并段（待 _probe_ppocr 本地实测通过再启用；VL 需GPU 已排除）=====
+      # - name: 安装 PP-OCR（CPU）
+      #   run: pip3 install paddlepaddle paddleocr --quiet
+      # - name: PP-OCRv6 识别 webp→txt（CPU）
+      #   run: python3 ocr_pages.py   # 遍历 webp_out 出 page_*.txt
+
+      - name: 存为 artifact（交本机回收，禁止 GitHub 直写123）
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-${{ inputs.pdf_fid }}
+          path: webp_out/
+          retention-days: 7
+
+      - name: 清理——转完即删 draft release（PDF 不留公开仓）
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          curl -s -o /dev/null -w 'del_release HTTP=%{http_code}\n' \
+            -X DELETE -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/$RELEASE_ID"
