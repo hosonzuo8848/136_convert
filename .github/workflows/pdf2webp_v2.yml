@@ -1,4 +1,5 @@
 name: PDF→WebP（公开仓 published release 匿名直链，零 token 零123凭据）
+run-name: pdf-${{ inputs.pdf_fid }}
 
 # 链路（10-29 方案B，GitHub 直连 123 被 IP 封制作废）：
 #   本机直连下载 136 PDF → 传【公开仓 published release】→ 匿名直链
